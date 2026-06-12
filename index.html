@@ -35,6 +35,9 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f5f5f0;color:#1a
 .btn-sm{padding:5px 10px;font-size:12px}
 .btn-danger{background:var(--red-bg);color:var(--red);border:1px solid #fecaca}
 .btn-success{background:var(--green-bg);color:var(--green);border:1px solid #bbf7d0}
+.btn-ai{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none}
+.btn-ai:hover{opacity:0.88}
+.btn-ai:disabled{opacity:0.5;cursor:not-allowed}
 .input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:7px;font-size:13px;outline:none;background:#fff;color:var(--text)}
 .input:focus{border-color:var(--teal);box-shadow:0 0 0 3px rgba(13,148,136,0.1)}
 .textarea{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:7px;font-size:13px;outline:none;resize:vertical;font-family:inherit;background:#fff;color:var(--text)}
@@ -48,6 +51,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f5f5f0;color:#1a
 .badge-green{background:#dcfce7;color:#166534}
 .badge-gray{background:#f3f4f6;color:#4b5563}
 .badge-blue{background:#dbeafe;color:#1e40af}
+.badge-ai{background:linear-gradient(135deg,#667eea22,#764ba222);color:#5a3fcf;border:1px solid #c4b5fd}
 .score-bar{height:6px;background:#e5e7eb;border-radius:3px;overflow:hidden}
 .score-fill{height:100%;border-radius:3px;background:var(--teal);transition:width 0.3s}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
@@ -104,6 +108,13 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f5f5f0;color:#1a
 .tab-row{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px}
 .tab{padding:8px 16px;font-size:13px;cursor:pointer;color:var(--gray);border-bottom:2px solid transparent;margin-bottom:-1px}
 .tab.active{color:var(--teal);border-bottom-color:var(--teal);font-weight:500}
+.ai-status-loading{color:#764ba2;font-size:12px;display:flex;align-items:center;gap:6px}
+.ai-status-loading::before{content:"";width:10px;height:10px;border:2px solid #c4b5fd;border-top-color:#764ba2;border-radius:50%;display:inline-block;animation:spin 0.7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ai-banner{background:linear-gradient(135deg,#f5f3ff,#ede9fe);border:1px solid #c4b5fd;border-radius:8px;padding:12px 16px;display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.ai-banner-icon{font-size:20px;color:#7c3aed}
+.ai-banner-text{font-size:13px;color:#5b21b6;flex:1}
+.ai-banner-text strong{display:block;font-size:13px;margin-bottom:2px}
 /* ===== AUTH LAYER ===== */
 .auth-screen{position:fixed;inset:0;background:#f5f5f0;display:flex;align-items:center;justify-content:center;z-index:200}
 .auth-card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:36px 32px;width:100%;max-width:400px;box-shadow:0 8px 32px rgba(0,0,0,0.08)}
@@ -151,11 +162,95 @@ let state = {
   screen:"home",cv:JSON.parse(JSON.stringify(STARTER_CV)),
   jd:{rawText:"",keywords:[],mustHave:[],niceToHave:[],title:"",seniority:"",domain:""},
   matching:{bullets:[],selectedIds:new Set()},
-  rewrites:{},rewriteStatuses:{},
+  rewrites:{},rewriteStatuses:{},aiRewriteStatuses:{},
+  geminiKey:"",
   sessionId:"sess_"+Date.now(),expandedExp:null,addBulletExp:null,modal:null,
   cvTab:"experience"
 };
 
+// ===== GEMINI AI REWRITE =====
+async function geminiRewrite(bullet, jdTitle, jdKeywords) {
+  if (!state.geminiKey) {
+    alert("Please add your Gemini API key in Settings first.");
+    return null;
+  }
+  const facts = (bullet.facts?.metrics || []).join(", ");
+  const prompt = `You are a resume writing expert. Rewrite the following resume bullet point to be more aligned with a "${jdTitle}" role.
+
+STRICT RULES:
+1. You MUST preserve every number, percentage, metric, and proper noun exactly: ${facts || "none"}
+2. Do NOT invent any new metrics, claims, or facts
+3. Output ONLY the rewritten bullet — no explanation, no quotes, no preamble
+4. Keep it under 30 words
+5. Start with a strong action verb
+6. Naturally incorporate 1-2 of these keywords if they fit: ${(jdKeywords||[]).slice(0,5).join(", ")}
+
+Original bullet: "${bullet.original}"`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${state.geminiKey}`;
+  const body = {
+    contents:[{parts:[{text:prompt}]}],
+    generationConfig:{temperature:0.4,maxOutputTokens:120}
+  };
+  const res = await fetch(url, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    throw new Error(err?.error?.message || `API error ${res.status}`);
+  }
+  const data = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  if (!text) throw new Error("Empty response from Gemini");
+  return text;
+}
+
+async function triggerAIRewrite(bulletId) {
+  const allBullets = [];
+  state.cv.experience.forEach(exp => exp.bullets.forEach(b => allBullets.push({...b,company:exp.company,expTitle:exp.title})));
+  const bullet = allBullets.find(b => b.id === bulletId);
+  if (!bullet) return;
+
+  state.aiRewriteStatuses[bulletId] = "loading";
+  render();
+
+  try {
+    const result = await geminiRewrite(bullet, state.jd.title || "Product Manager", state.jd.keywords);
+    if (result) {
+      state.rewrites[bulletId] = result;
+      state.aiRewriteStatuses[bulletId] = "done";
+      state.rewriteStatuses[bulletId] = "pending"; // reset approval so user reviews
+    }
+  } catch(err) {
+    state.aiRewriteStatuses[bulletId] = "error:" + err.message;
+  }
+  render();
+}
+
+async function triggerAIRewriteAll() {
+  if (!state.geminiKey) { alert("Please add your Gemini API key in Settings first."); return; }
+  const sel = state.matching.selectedIds;
+  const allBullets = [];
+  state.cv.experience.forEach(exp => exp.bullets.forEach(b => { if(sel.has(b.id)) allBullets.push(b); }));
+  for (const b of allBullets) {
+    state.aiRewriteStatuses[b.id] = "loading";
+  }
+  render();
+  for (const b of allBullets) {
+    try {
+      const result = await geminiRewrite(b, state.jd.title || "Product Manager", state.jd.keywords);
+      if (result) {
+        state.rewrites[b.id] = result;
+        state.aiRewriteStatuses[b.id] = "done";
+        state.rewriteStatuses[b.id] = "pending";
+      }
+    } catch(err) {
+      state.aiRewriteStatuses[b.id] = "error:" + err.message;
+    }
+    render();
+    await new Promise(r => setTimeout(r, 500)); // gentle rate limit
+  }
+}
+
+// ===== KEYWORD EXTRACTION =====
 function extractKeywords(text){
   const lower=text.toLowerCase();
   const kwMap={"product strategy":7,"roadmap":7,"product roadmap":8,"prioritization":6,"stakeholder management":8,"user research":7,"customer discovery":8,"product metrics":7,"agile":6,"sprint":5,"backlog":6,"go-to-market":7,"gtm":7,"analytics":8,"sql":6,"experimentation":7,"a/b testing":6,"cross-functional":8,"okr":6,"data-driven":5,"b2b":6,"saas":7,"enterprise":7,"growth":6,"retention":5,"acquisition":5,"market research":6,"competitive analysis":6,"positioning":6,"launch":5,"roadmapping":5,"power bi":5,"tableau":5,"stakeholder":6};
@@ -192,12 +287,13 @@ function ruleRewrite(bullet,jdTitle){
   Object.keys(pmVerbs).forEach(v=>{text=text.replace(new RegExp("^"+v),pmVerbs[v])});
   const pmSwaps=[["marketing-qualified leads","MQLs"],["battle cards","product enablement materials"],["business development","growth initiatives"]];
   pmSwaps.forEach(([a,b])=>{if(!bullet.original.toLowerCase().includes("product"))text=text.replace(new RegExp(a,"gi"),b)});
-  const words=text.split(" ");if(words.length>30){text=words.slice(0,28).join(" ")+".";}
+  const words=text.split(" ");if(words.length>30){text=words.slice(0,28).join(" ")+"."; }
   text=text.replace(/\s+/g," ").trim();
   if(!text.endsWith("."))text+=".";
   return text===bullet.original?text.replace(/\./,"— driving measurable business impact.").replace(/—\./,"."):text;
 }
 
+// ===== RENDER =====
 function render(){
   const app=document.getElementById("app");
   if(!app)return;
@@ -207,15 +303,16 @@ function render(){
 }
 
 function renderSidebar(){
-  const steps=["home","master-cv","jd-analyzer","match-studio","rewrite-review","export"];
-  const labels={home:"Home","master-cv":"Master CV","jd-analyzer":"JD Analyzer","match-studio":"Match Studio","rewrite-review":"Rewrite Review",export:"Export"};
-  const icons={home:"ti-home","master-cv":"ti-file-cv","jd-analyzer":"ti-file-text","match-studio":"ti-adjustments","rewrite-review":"ti-check",export:"ti-download"};
+  const steps=["home","master-cv","jd-analyzer","match-studio","rewrite-review","export","settings"];
+  const labels={home:"Home","master-cv":"Master CV","jd-analyzer":"JD Analyzer","match-studio":"Match Studio","rewrite-review":"Rewrite Review",export:"Export",settings:"Settings"};
+  const icons={home:"ti-home","master-cv":"ti-file-cv","jd-analyzer":"ti-file-text","match-studio":"ti-adjustments","rewrite-review":"ti-check",export:"ti-download",settings:"ti-settings"};
+  const hasKey = !!state.geminiKey;
   return`<div class="sidebar">
-    <div class="logo"><div class="logo-text">RoleTailor</div><div class="logo-sub">Cloud &middot; Auto-save</div></div>
+    <div class="logo"><div class="logo-text">RoleTailor</div><div class="logo-sub">Cloud &middot; AI-powered</div></div>
     <nav class="nav">
       ${steps.map((s)=>`
-        <div class="nav-item ${state.screen===s?"active":""}" data-nav="${s}">
-          <i class="ti ${icons[s]}" aria-hidden="true"></i>${labels[s]}
+        <div class="nav-item ${state.screen===s?"active":""}${s==="settings"&&!hasKey?" style=\"border-left:2px solid #f59e0b\"":""}" data-nav="${s}">
+          <i class="ti ${icons[s]}" aria-hidden="true"></i>${labels[s]}${s==="settings"&&!hasKey?` <span style="font-size:9px;background:#fef3c7;color:#92400e;padding:1px 5px;border-radius:3px;margin-left:auto">key</span>`:""}
         </div>`).join("")}
     </nav>
     <div class="user-chip" id="user-chip">
@@ -227,9 +324,74 @@ function renderSidebar(){
 }
 
 function renderMain(){
-  const screens={home:renderHome,"master-cv":renderMasterCV,"jd-analyzer":renderJDAnalyzer,"match-studio":renderMatchStudio,"rewrite-review":renderRewriteReview,export:renderExport};
+  const screens={home:renderHome,"master-cv":renderMasterCV,"jd-analyzer":renderJDAnalyzer,"match-studio":renderMatchStudio,"rewrite-review":renderRewriteReview,export:renderExport,settings:renderSettings};
   const modal=state.modal?renderModal():"";
   return`<div class="content">${(screens[state.screen]||renderHome)()}${modal}</div>`;
+}
+
+function renderSettings(){
+  const hasKey = !!state.geminiKey;
+  return`<div class="screen">
+    <div class="screen-title">Settings</div>
+    <div class="screen-sub">Configure AI-powered rewriting. Your API key is stored only in this browser session — never sent to our servers.</div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:18px">✨</span> Gemini AI Rewriting
+          ${hasKey?`<span class="badge badge-green"><i class="ti ti-check"></i> Key saved</span>`:`<span class="badge badge-amber">Not configured</span>`}
+        </div>
+      </div>
+      <p style="font-size:13px;color:var(--gray);margin-bottom:16px;line-height:1.6">
+        Uses <strong>Gemini 2.0 Flash</strong> — Google's free-tier model. Get a free API key at
+        <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" style="color:var(--teal)">aistudio.google.com</a>.
+        The free tier has generous limits (1500 req/day). Your key never leaves your browser.
+      </p>
+      <div class="field">
+        <label class="label">Gemini API Key</label>
+        <div style="display:flex;gap:8px">
+          <input class="input" type="password" id="gemini-key-input" placeholder="AIza..." value="${state.geminiKey}" style="flex:1"/>
+          <button class="btn btn-primary" id="btn-save-gemini-key"><i class="ti ti-check"></i> Save</button>
+          ${hasKey?`<button class="btn btn-danger" id="btn-clear-gemini-key"><i class="ti ti-trash"></i></button>`:""}
+        </div>
+        <div style="font-size:11px;color:var(--gray);margin-top:6px">Stored in memory only — cleared when you close the tab.</div>
+      </div>
+      ${hasKey?`
+      <div style="background:var(--green-bg);border:1px solid #bbf7d0;border-radius:8px;padding:12px;font-size:13px;color:var(--green)">
+        <i class="ti ti-check-circle"></i> AI rewriting is active. Go to <strong>Rewrite Review</strong> and use the "✨ AI Rewrite" button on any bullet.
+      </div>`:""}
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div class="card-title">How AI rewriting works</div></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+        <div style="text-align:center;padding:12px">
+          <div style="font-size:24px;margin-bottom:8px">🔒</div>
+          <div style="font-size:13px;font-weight:600;color:var(--navy);margin-bottom:4px">Fact-locked</div>
+          <div style="font-size:12px;color:var(--gray)">Every metric, number, and name from your original bullet is preserved exactly</div>
+        </div>
+        <div style="text-align:center;padding:12px">
+          <div style="font-size:24px;margin-bottom:8px">🎯</div>
+          <div style="font-size:13px;font-weight:600;color:var(--navy);margin-bottom:4px">JD-aware</div>
+          <div style="font-size:12px;color:var(--gray)">Rewrites naturally weave in keywords from the job description you've loaded</div>
+        </div>
+        <div style="text-align:center;padding:12px">
+          <div style="font-size:24px;margin-bottom:8px">✅</div>
+          <div style="font-size:13px;font-weight:600;color:var(--navy);margin-bottom:4px">You approve</div>
+          <div style="font-size:12px;color:var(--gray)">Every rewrite needs your approval before it appears in the exported resume</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div class="card-title">Session data</div></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-secondary btn-sm" id="btn-export-json"><i class="ti ti-download"></i> Save session JSON</button>
+        <button class="btn btn-secondary btn-sm" id="btn-import-json"><i class="ti ti-upload"></i> Load session JSON</button>
+        <input type="file" id="import-file" accept=".json" style="display:none"/>
+      </div>
+    </div>
+  </div>`;
 }
 
 function renderHome(){
@@ -237,9 +399,18 @@ function renderHome(){
   const totalBullets=state.cv.experience.reduce((a,e)=>a+e.bullets.length,0);
   const selectedCount=state.matching.selectedIds?.size||0;
   const approvedCount=Object.values(state.rewriteStatuses).filter(s=>s==="approved").length;
+  const hasKey = !!state.geminiKey;
   return`<div class="screen">
     <div class="screen-title">RoleTailor</div>
-    <div class="screen-sub">Tailor your resume to any job description &mdash; all matching on-device, data saved to your account.</div>
+    <div class="screen-sub">Tailor your resume to any job description &mdash; matching on-device, AI rewriting via Gemini.</div>
+    ${!hasKey?`<div class="ai-banner">
+      <div class="ai-banner-icon"><i class="ti ti-sparkles"></i></div>
+      <div class="ai-banner-text"><strong>Enable AI rewriting</strong>Add your free Gemini API key in Settings to unlock AI-powered bullet rewrites.</div>
+      <button class="btn btn-sm" style="background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:none" data-nav="settings">Add key →</button>
+    </div>`:`<div class="ai-banner" style="background:linear-gradient(135deg,#f0fdf4,#dcfce7);border-color:#bbf7d0">
+      <div class="ai-banner-icon" style="color:#16a34a"><i class="ti ti-sparkles"></i></div>
+      <div class="ai-banner-text" style="color:#166534"><strong>AI rewriting active</strong>Gemini 2.0 Flash is ready. Select bullets in Match Studio, then rewrite in Rewrite Review.</div>
+    </div>`}
     <div class="home-actions">
       <div class="action-card" data-nav="master-cv">
         <div class="action-icon"><i class="ti ti-file-cv"></i></div>
@@ -271,14 +442,6 @@ function renderHome(){
           `).join("")}
         </div>
         <span style="font-size:12px;color:var(--gray)">Build &rarr; Analyze &rarr; Match &rarr; Review &rarr; Export</span>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><div class="card-title">Quick import / export</div></div>
-      <div style="display:flex;gap:8px">
-        <button class="btn btn-secondary btn-sm" id="btn-export-json"><i class="ti ti-download"></i> Save session JSON</button>
-        <button class="btn btn-secondary btn-sm" id="btn-import-json"><i class="ti ti-upload"></i> Load session JSON</button>
-        <input type="file" id="import-file" accept=".json" style="display:none"/>
       </div>
     </div>
   </div>`;
@@ -458,13 +621,18 @@ function renderRewriteReview(){
   state.cv.experience.forEach(exp=>{exp.bullets.forEach(b=>{if(sel.has(b.id))allBullets.push({...b,company:exp.company,expTitle:exp.title});})});
   if(allBullets.length===0)return`<div class="screen"><div class="screen-title">Rewrite Review</div><div class="card" style="text-align:center;padding:40px"><i class="ti ti-arrow-left" style="font-size:24px;color:var(--gray)"></i><div style="margin-top:8px;color:var(--gray);font-size:14px">No bullets selected yet &mdash; go to Match Studio first.</div><button class="btn btn-secondary" style="margin-top:12px" data-nav="match-studio">&larr; Match Studio</button></div></div>`;
   const jdTitle=state.jd.title||"Product Manager";
+  const hasKey = !!state.geminiKey;
+  const anyLoading = allBullets.some(b => state.aiRewriteStatuses[b.id]==="loading");
   return`<div class="screen">
     <div class="screen-title">Rewrite Review</div>
-    <div class="screen-sub">Review each rewrite. Facts are locked &mdash; numbers, dates, and names cannot be changed by the rule engine.</div>
+    <div class="screen-sub">Review each rewrite. Facts are locked &mdash; numbers, dates, and names are preserved.</div>
     <div class="card" style="padding:12px 16px;margin-bottom:16px">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <span style="font-size:13px">Target role: <strong>${jdTitle}</strong></span>
-        <button class="btn btn-success btn-sm" id="btn-approve-all"><i class="ti ti-check"></i> Approve all rewrites</button>
+        <button class="btn btn-success btn-sm" id="btn-approve-all"><i class="ti ti-check"></i> Approve all</button>
+        ${hasKey?`<button class="btn btn-ai btn-sm" id="btn-ai-rewrite-all" ${anyLoading?"disabled":""}>
+          <i class="ti ti-sparkles"></i> ${anyLoading?"AI rewriting…":"AI Rewrite All"}
+        </button>`:`<button class="btn btn-secondary btn-sm" data-nav="settings" style="border:1px dashed #c4b5fd;color:#7c3aed"><i class="ti ti-sparkles"></i> Enable AI</button>`}
         <span class="badge badge-amber"><i class="ti ti-lock" style="font-size:11px"></i> Fact-lock active</span>
         <span class="badge badge-gray">${Object.values(state.rewriteStatuses).filter(s=>s==="approved").length}/${allBullets.length} approved</span>
       </div>
@@ -473,19 +641,27 @@ function renderRewriteReview(){
       const rewritten=state.rewrites[b.id]||ruleRewrite(b,jdTitle);
       if(!state.rewrites[b.id])state.rewrites[b.id]=rewritten;
       const status=state.rewriteStatuses[b.id]||"pending";
+      const aiStatus=state.aiRewriteStatuses[b.id];
+      const isAILoading=aiStatus==="loading";
+      const isAIDone=aiStatus==="done";
+      const isAIError=aiStatus&&aiStatus.startsWith("error:");
       return`<div class="card" style="margin-bottom:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <span style="font-size:13px;font-weight:500">${b.expTitle} &middot; ${b.company}</span>
-            ${(b.facts?.metrics||[]).map(m=>`<span class="badge badge-amber" style="margin-left:6px"><i class="ti ti-lock" style="font-size:10px"></i>${m}</span>`).join("")}
+            ${(b.facts?.metrics||[]).map(m=>`<span class="badge badge-amber"><i class="ti ti-lock" style="font-size:10px"></i>${m}</span>`).join("")}
+            ${isAIDone?`<span class="badge badge-ai"><i class="ti ti-sparkles" style="font-size:10px"></i> AI rewritten</span>`:""}
+            ${isAILoading?`<span class="ai-status-loading">AI rewriting…</span>`:""}
+            ${isAIError?`<span class="badge badge-red" title="${aiStatus.replace('error:','')}"><i class="ti ti-alert-circle" style="font-size:10px"></i> AI error</span>`:""}
           </div>
           <div class="review-status">
+            ${hasKey&&!isAILoading?`<button class="btn btn-sm btn-ai" data-ai-rewrite="${b.id}" title="Rewrite with Gemini AI"><i class="ti ti-sparkles"></i></button>`:""}
             ${status==="approved"?`<span class="badge badge-green"><i class="ti ti-check"></i> Approved</span>`:`<button class="btn btn-success btn-sm" data-approve="${b.id}"><i class="ti ti-check"></i> Approve</button><button class="btn btn-danger btn-sm" data-reject="${b.id}"><i class="ti ti-x"></i> Reject</button>`}
           </div>
         </div>
         <div class="diff-block">
           <div class="diff-orig"><div class="diff-label">Original</div><div class="diff-text">${b.original}</div></div>
-          <div class="diff-new"><div class="diff-label">Rewritten for ${jdTitle}</div><div class="diff-text">${status==="rejected"?b.original:rewritten}</div></div>
+          <div class="diff-new"><div class="diff-label">${isAIDone?"✨ AI rewrite for "+jdTitle:"Rewritten for "+jdTitle}</div><div class="diff-text">${status==="rejected"?b.original:rewritten}</div></div>
         </div>
       </div>`;
     }).join("")}
@@ -581,122 +757,20 @@ function attachEvents(){
   document.querySelectorAll("[data-select-bullet]").forEach(el=>{el.addEventListener("change",e=>{const bid=el.dataset.selectBullet;if(e.target.checked)state.matching.selectedIds.add(bid);else state.matching.selectedIds.delete(bid);render();});});
   document.querySelectorAll("[data-approve]").forEach(el=>{el.addEventListener("click",()=>{state.rewriteStatuses[el.dataset.approve]="approved";render();});});
   document.querySelectorAll("[data-reject]").forEach(el=>{el.addEventListener("click",()=>{state.rewriteStatuses[el.dataset.reject]="rejected";render();});});
+
+  // AI rewrite buttons
+  document.querySelectorAll("[data-ai-rewrite]").forEach(el=>{el.addEventListener("click",()=>triggerAIRewrite(el.dataset.aiRewrite));});
+  const aiAllBtn=document.getElementById("btn-ai-rewrite-all");if(aiAllBtn)aiAllBtn.addEventListener("click",triggerAIRewriteAll);
+
+  // Settings — Gemini key
+  const saveKeyBtn=document.getElementById("btn-save-gemini-key");
+  if(saveKeyBtn)saveKeyBtn.addEventListener("click",()=>{const val=document.getElementById("gemini-key-input")?.value.trim();if(val){state.geminiKey=val;render();}else{alert("Please enter a valid API key.");}});
+  const clearKeyBtn=document.getElementById("btn-clear-gemini-key");
+  if(clearKeyBtn)clearKeyBtn.addEventListener("click",()=>{state.geminiKey="";render();});
+
   const analyzeBtn=document.getElementById("btn-analyze-jd");if(analyzeBtn)analyzeBtn.addEventListener("click",()=>{const text=document.getElementById("jd-input")?.value||"";if(text.length<30)return;state.jd={rawText:text,...extractKeywords(text)};render();});
   const selectMust=document.getElementById("btn-select-must");if(selectMust)selectMust.addEventListener("click",()=>{const allBullets=[];state.cv.experience.forEach(exp=>{exp.bullets.forEach(b=>{allBullets.push(b);})});const scored=allBullets.map(b=>scoreBullet(b,state.jd));scored.forEach(b=>{if(b.recommendation==="must-include"||b.recommendation==="good-option")state.matching.selectedIds.add(b.id);});render();});
   const clearSel=document.getElementById("btn-clear-sel");if(clearSel)clearSel.addEventListener("click",()=>{state.matching.selectedIds.clear();render();});
   const approveAll=document.getElementById("btn-approve-all");if(approveAll)approveAll.addEventListener("click",()=>{state.matching.selectedIds.forEach(id=>{state.rewriteStatuses[id]="approved";});render();});
   const saveBullet=document.getElementById("btn-save-bullet");if(saveBullet)saveBullet.addEventListener("click",()=>{const bid=saveBullet.dataset.bid;const eid=saveBullet.dataset.eid;const exp=state.cv.experience.find(e=>e.id===eid);if(!exp)return;const bullet=exp.bullets.find(b=>b.id===bid);if(!bullet)return;bullet.original=document.getElementById("modal-bullet-text")?.value||bullet.original;bullet.tags=document.getElementById("modal-bullet-tags")?.value.split(",").map(t=>t.trim()).filter(Boolean)||bullet.tags;const metrics=document.getElementById("modal-bullet-metrics")?.value.split(",").map(m=>m.trim()).filter(Boolean)||[];if(!bullet.facts)bullet.facts={};bullet.facts.metrics=metrics;state.modal=null;render();});
-  const addBulletSave=document.getElementById("btn-add-bullet-save");if(addBulletSave)addBulletSave.addEventListener("click",()=>{const eid=addBulletSave.dataset.eid;const exp=state.cv.experience.find(e=>e.id===eid);if(!exp)return;const text=document.getElementById("modal-bullet-text")?.value||"";if(!text.trim())return;const tags=document.getElementById("modal-bullet-tags")?.value.split(",").map(t=>t.trim()).filter(Boolean)||[];const metrics=document.getElementById("modal-bullet-metrics")?.value.split(",").map(m=>m.trim()).filter(Boolean)||[];exp.bullets.push({id:"b"+Date.now(),original:text,facts:{metrics,tools:[],entities:[]},tags,competencies:[],targetRoles:["pm"],priority:0.7});state.modal=null;render();});
-  const closeModal=document.getElementById("btn-close-modal");if(closeModal)closeModal.addEventListener("click",()=>{state.modal=null;render();});
-  const overlay=document.getElementById("modal-overlay");if(overlay)overlay.addEventListener("click",e=>{if(e.target===overlay){state.modal=null;render();}});
-  const printBtn=document.getElementById("btn-print");if(printBtn)printBtn.addEventListener("click",()=>{const preview=document.getElementById("export-preview");if(!preview)return;const w=window.open("","_blank");w.document.write(`<!DOCTYPE html><html><head><title>Resume - ${state.cv.profile.fullName}</title><style>body{font-family:Georgia,serif;max-width:680px;margin:40px auto;font-size:12px;line-height:1.7;color:#111}.export-name{font-size:20px;font-weight:700}.export-sh{text-transform:uppercase;font-size:10px;letter-spacing:1px;border-bottom:1px solid #ccc;margin:12px 0 6px;font-weight:700}.export-role{display:flex;justify-content:space-between}.export-bullet{margin-left:14px;margin-bottom:2px;position:relative}.export-bullet::before{content:"•";position:absolute;left:-10px}@media print{body{margin:20px}}</style></head><body>${preview.innerHTML}</body></html>`);w.document.close();w.focus();setTimeout(()=>w.print(),300);});
-  const copyText=document.getElementById("btn-copy-text");if(copyText)copyText.addEventListener("click",()=>{const preview=document.getElementById("export-preview");if(!preview)return;navigator.clipboard.writeText(preview.innerText).then(()=>{copyText.innerHTML='<i class="ti ti-check"></i> Copied!';setTimeout(()=>{copyText.innerHTML='<i class="ti ti-copy"></i> Copy plain text';},2000);});});
-  const saveJson=document.getElementById("btn-save-json");if(saveJson)saveJson.addEventListener("click",saveSession);
-  const exportJsonBtn=document.getElementById("btn-export-json");if(exportJsonBtn)exportJsonBtn.addEventListener("click",saveSession);
-  const importBtn=document.getElementById("btn-import-json");const importFile=document.getElementById("import-file");
-  if(importBtn&&importFile){importBtn.addEventListener("click",()=>importFile.click());importFile.addEventListener("change",e=>{const file=e.target.files[0];if(!file)return;const reader=new FileReader();reader.onload=ev=>{try{const data=JSON.parse(ev.target.result);if(data.cv)state.cv=data.cv;if(data.jd)state.jd=data.jd;if(data.rewrites)state.rewrites=data.rewrites;if(data.rewriteStatuses)state.rewriteStatuses=data.rewriteStatuses;if(data.matching?.selectedIds)state.matching.selectedIds=new Set(data.matching.selectedIds);render();}catch(err){alert("Invalid JSON file — make sure it was saved by RoleTailor.");}};reader.readAsText(file);});}
-}
-
-function saveSession(){
-  const data={cv:state.cv,jd:state.jd,matching:{selectedIds:[...state.matching.selectedIds]},rewrites:state.rewrites,rewriteStatuses:state.rewriteStatuses,sessionId:state.sessionId,savedAt:new Date().toISOString()};
-  const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
-  const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="roletailor-session.json";a.click();URL.revokeObjectURL(url);
-}
-
-function updateUserChip(){
-  const avatar=document.getElementById("user-avatar");
-  const emailEl=document.getElementById("user-email-display");
-  if(avatar&&authUser){
-    avatar.textContent=(authUser.email||"U").substring(0,1).toUpperCase();
-    if(emailEl)emailEl.textContent=authUser.email||"";
-  } else if(avatar){
-    avatar.textContent="?";
-    if(emailEl)emailEl.textContent="Not signed in";
-  }
-}
-
-// ===== SUPABASE AUTH =====
-const SUPA_URL="https://ifyhqvcuffhtjngvapwi.supabase.co";
-const SUPA_KEY="sb_publishable_sVaRDZdyNeobqzawzG4t6g_yEpNnmOk";
-let supabase=null;
-let authUser=null;
-
-async function initSupabase(){
-  const {createClient}=window.supabase;
-  supabase=createClient(SUPA_URL,SUPA_KEY);
-  const {data:{session}}=await supabase.auth.getSession();
-  authUser=session?.user||null;
-  supabase.auth.onAuthStateChange((_event,session)=>{
-    authUser=session?.user||null;
-    if(!authUser)renderAuth();
-    else{document.getElementById("auth-screen")?.remove();render();}
-  });
-}
-
-function renderAuth(tab="login"){
-  let existing=document.getElementById("auth-screen");
-  if(existing)existing.remove();
-  const el=document.createElement("div");
-  el.id="auth-screen";
-  el.className="auth-screen";
-  el.innerHTML=`
-    <div class="auth-card">
-      <div class="auth-logo">
-        <div class="auth-logo-text">RoleTailor</div>
-        <div class="auth-logo-sub">AI-powered resume tailoring &middot; Your data, your cloud</div>
-      </div>
-      <div class="auth-tabs">
-        <div class="auth-tab ${tab==="login"?"active":""}" id="auth-tab-login">Sign in</div>
-        <div class="auth-tab ${tab==="signup"?"active":""}" id="auth-tab-signup">Create account</div>
-      </div>
-      <div class="auth-msg" id="auth-msg"></div>
-      <div class="field"><label class="label">Email</label><input class="input" id="auth-email" type="email" placeholder="you@email.com" autocomplete="email"/></div>
-      <div class="field"><label class="label">Password</label><input class="input" id="auth-password" type="password" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="${tab==="login"?"current-password":"new-password"}"/></div>
-      <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" id="auth-submit">${tab==="login"?"Sign in":"Create account"}</button>
-      <div class="auth-footer">
-        ${tab==="login"
-          ?'No account? <span style="color:#0d9488;cursor:pointer" id="auth-switch-signup">Create one free</span>'
-          :'Already have an account? <span style="color:#0d9488;cursor:pointer" id="auth-switch-login">Sign in</span>'
-        }<br/>Your resume data is stored privately in your account.
-      </div>
-    </div>`;
-  document.body.appendChild(el);
-  document.getElementById("auth-tab-login").onclick=()=>renderAuth("login");
-  document.getElementById("auth-tab-signup").onclick=()=>renderAuth("signup");
-  document.getElementById("auth-switch-signup")?.addEventListener("click",()=>renderAuth("signup"));
-  document.getElementById("auth-switch-login")?.addEventListener("click",()=>renderAuth("login"));
-  document.getElementById("auth-email").focus();
-  document.getElementById("auth-submit").addEventListener("click",async()=>{
-    const email=document.getElementById("auth-email").value.trim();
-    const password=document.getElementById("auth-password").value;
-    const msgEl=document.getElementById("auth-msg");
-    msgEl.className="auth-msg";msgEl.textContent="";
-    if(!email||!password){msgEl.className="auth-msg error";msgEl.textContent="Please enter email and password.";return;}
-    const btn=document.getElementById("auth-submit");
-    btn.disabled=true;btn.textContent="Please wait\u2026";
-    let error,data;
-    if(tab==="login"){({data,error}=await supabase.auth.signInWithPassword({email,password}));}
-    else{({data,error}=await supabase.auth.signUp({email,password}));}
-    btn.disabled=false;btn.textContent=tab==="login"?"Sign in":"Create account";
-    if(error){msgEl.className="auth-msg error";msgEl.textContent=error.message;return;}
-    if(tab==="signup"&&data?.user&&!data?.session){
-      msgEl.className="auth-msg success";
-      msgEl.textContent="Check your email for a confirmation link, then sign in.";
-      return;
-    }
-  });
-  document.getElementById("auth-password").addEventListener("keydown",e=>{if(e.key==="Enter")document.getElementById("auth-submit").click();});
-}
-
-async function signOut(){
-  await supabase.auth.signOut();
-}
-
-// Boot
-initSupabase().then(()=>{
-  if(!authUser)renderAuth();
-  else render();
-});
-</script>
-</body>
-</html>
+  const addBulletSave=document.getElementById("btn-add-bullet-save");if(addBulletSave)addBulletSave.addEventListener("click",()=>{const eid=addBulletSave.dataset.eid;const exp=state.cv.experience.find(e=>e.id===eid);if(!exp)return;const text=document.getElementById("modal-bullet-text")?.value||"";if(!text.trim())return;const tags=document.getElementById("modal-bullet-tags")?.value.split(",").map(t=>t.trim()).filter(Boolean)||[];const metrics=document.getElemen
